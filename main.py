@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import logging
 import threading
 import requests
@@ -17,8 +18,38 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# ─── Lock global — protege SOLO accesos a dicts, nunca I/O ───────────────────
+# ─── Lock global ─────────────────────────────────────────────────────────────
 data_lock = threading.Lock()
+
+# ─── Persistencia compartida entre workers (archivo JSON) ───────────────────
+# FIX: Railway permite escribir en /tmp. Todos los workers leen/escriben
+# el mismo archivo, así que /desactivar en el worker A y /reanudar en el
+# worker B se ven mutuamente.
+STATE_FILE = "/tmp/tjcctv_state.json"
+
+
+def _load_state() -> dict:
+    """Carga estado desde disco. Si no existe, devuelve estructura vacía."""
+    if not os.path.exists(STATE_FILE):
+        return {"conversations": {}, "muted_contacts": {}}
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        logger.error("Error leyendo state file, reiniciando estado.")
+        return {"conversations": {}, "muted_contacts": {}}
+
+
+def _save_state(state: dict):
+    """Guarda estado a disco de forma atómica (escribe temporal, renombra)."""
+    tmp_file = STATE_FILE + ".tmp"
+    try:
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False)
+        os.replace(tmp_file, STATE_FILE)
+    except IOError as e:
+        logger.error(f"Error guardando state file: {e}")
+
 
 # ─── Credenciales ─────────────────────────────────────────────────────────────
 GEMINI_API_KEY      = os.environ.get("GEMINI_API_KEY")
@@ -31,14 +62,11 @@ VALIDATE_TWILIO     = os.environ.get("VALIDATE_TWILIO", "false").lower() == "tru
 if not GEMINI_API_KEY:
     raise ValueError("Error Crítico: Falta GEMINI_API_KEY en Railway")
 
-# ─── Almacenes en memoria ─────────────────────────────────────────────────────
-conversations:  dict = {}
-muted_contacts: dict = {}
-
-SESSION_TIMEOUT_SECONDS  = 60 * 60 * 4
-MUTE_DURATION_SECONDS    = 60 * 60 * 4
+# ─── Constantes ───────────────────────────────────────────────────────────────
+SESSION_TIMEOUT_SECONDS  = 60 * 60 * 4   # 4 horas
+MUTE_DURATION_SECONDS    = 60 * 60 * 4   # 4 horas
 MAX_HISTORY_MESSAGES     = 20
-CLEANUP_INTERVAL_SECONDS = 60 * 60  # cada hora
+CLEANUP_INTERVAL_SECONDS = 60 * 60       # 1 hora
 
 ESCALATION_PHRASE  = "Permíteme un momento, voy a corroborar en el sistema."
 ESCALATION_TRIGGER = "corroborar en el sistema"
@@ -97,51 +125,100 @@ REGLAS OBLIGATORIAS DE OPERACIÓN
    seguridad. ¿Te puedo orientar en algo de eso?"
 """.strip()
 
-# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+# ─── Helper: respuesta TwiML ─────────────────────────────────────────────────
+
+def _twiml_response(text: str) -> tuple:
+    """Genera una respuesta TwiML con escape XML."""
+    safe = (
+        text
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&apos;")
+    )
+    twiml = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        "<Response>\n"
+        f"    <Message>{safe}</Message>\n"
+        "</Response>"
+    )
+    return twiml, 200, {"Content-Type": "text/xml"}
+
+
+# ─── Helpers de estado ───────────────────────────────────────────────────────
 
 def _is_muted(user_id: str, now: float) -> bool:
-    """Verificación atómica de mute. Limpia entradas expiradas en el mismo paso."""
+    """Verifica si un número está muteado. Lee desde disco para ver a todos los workers."""
     with data_lock:
-        expiry = muted_contacts.get(user_id)
+        state = _load_state()
+        muted = state.get("muted_contacts", {})
+        expiry = muted.get(user_id)
         if expiry is None:
             return False
         if now < expiry:
             return True
-        del muted_contacts[user_id]
+        # Expiró — limpiar y guardar
+        del muted[user_id]
+        _save_state(state)
         logger.info(f"Silencio expirado y levantado para: {user_id}")
         return False
 
 
+def _get_conversation(user_id: str):
+    """Devuelve la sesión de un usuario desde disco."""
+    with data_lock:
+        state = _load_state()
+        return state.get("conversations", {}).get(user_id)
+
+
+def _save_conversation(user_id: str, session: dict):
+    """Guarda la sesión de un usuario a disco."""
+    with data_lock:
+        state = _load_state()
+        state["conversations"][user_id] = session
+        _save_state(state)
+
+
+# ─── Cleanup thread ───────────────────────────────────────────────────────────
+
 def _cleanup_expired_sessions():
-    """
-    Thread daemon que limpia sesiones y mutes expirados cada hora.
-    FIX: se inicia al nivel del módulo para que Gunicorn también lo arranque.
-    """
+    """Limpia sesiones y mutes expirados cada hora."""
     while True:
         time.sleep(CLEANUP_INTERVAL_SECONDS)
         now = time.time()
         with data_lock:
+            state = _load_state()
+            conversations = state.get("conversations", {})
+            muted = state.get("muted_contacts", {})
+
             expired_sessions = [
                 uid for uid, s in conversations.items()
-                if (now - s["last_active"]) > SESSION_TIMEOUT_SECONDS
+                if (now - s.get("last_active", 0)) > SESSION_TIMEOUT_SECONDS
             ]
             for uid in expired_sessions:
                 del conversations[uid]
-            if expired_sessions:
-                logger.info(f"Cleanup: {len(expired_sessions)} sesiones expiradas eliminadas.")
 
             expired_mutes = [
-                uid for uid, expiry in muted_contacts.items()
+                uid for uid, expiry in muted.items()
                 if now >= expiry
             ]
             for uid in expired_mutes:
-                del muted_contacts[uid]
-            if expired_mutes:
-                logger.info(f"Cleanup: {len(expired_mutes)} mutes expirados eliminados.")
+                del muted[uid]
 
+            if expired_sessions or expired_mutes:
+                logger.info(
+                    f"Cleanup: {len(expired_sessions)} sesiones, "
+                    f"{len(expired_mutes)} mutes eliminados."
+                )
+                _save_state(state)
+
+
+# ─── Alertas a José Luis ─────────────────────────────────────────────────────
 
 def _send_alert_worker(client_phone: str, last_msg: str):
-    """Thread daemon — envía alerta a José Luis sin bloquear el webhook."""
+    """Envía alerta a José Luis sin bloquear el webhook."""
     try:
         client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
         alert_text = (
@@ -161,9 +238,11 @@ def _send_alert_worker(client_phone: str, last_msg: str):
 
 
 def escalate_to_human(user_id: str, incoming_msg: str, now: float):
-    """Silencia el número y despacha la alerta en background."""
+    """Silencia el número y envía alerta a José Luis."""
     with data_lock:
-        muted_contacts[user_id] = now + MUTE_DURATION_SECONDS
+        state = _load_state()
+        state["muted_contacts"][user_id] = now + MUTE_DURATION_SECONDS
+        _save_state(state)
     logger.info(f"Escalación humana activada para: {user_id}")
     if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and MY_PERSONAL_NUMBER:
         threading.Thread(
@@ -174,6 +253,7 @@ def escalate_to_human(user_id: str, incoming_msg: str, now: float):
     else:
         logger.error("Faltan credenciales Twilio para enviar la alerta.")
 
+
 # ─── Lógica de Gemini ─────────────────────────────────────────────────────────
 
 def get_gemini_response(user_id: str, incoming_msg: str) -> str:
@@ -182,16 +262,14 @@ def get_gemini_response(user_id: str, incoming_msg: str) -> str:
     if _is_muted(user_id, now):
         return ""
 
-    with data_lock:
-        session = conversations.get(user_id)
-
-    if session and (now - session["last_active"]) > SESSION_TIMEOUT_SECONDS:
+    session = _get_conversation(user_id)
+    if session and (now - session.get("last_active", 0)) > SESSION_TIMEOUT_SECONDS:
         session = None
     if session is None:
         session = {"history": [], "last_active": now}
 
     # Copia local — la llamada HTTP ocurre FUERA de cualquier lock
-    snapshot = list(session["history"])
+    snapshot = list(session.get("history", []))
     contents = snapshot + [{"role": "user", "parts": [{"text": incoming_msg}]}]
 
     url = (
@@ -227,15 +305,17 @@ def get_gemini_response(user_id: str, incoming_msg: str) -> str:
 
         # Merge aditivo — el Hilo 2 nunca borra el trabajo del Hilo 1
         with data_lock:
-            current_session = conversations.get(user_id, {"history": [], "last_active": now})
+            state = _load_state()
+            current_session = state.get("conversations", {}).get(user_id, {"history": [], "last_active": now})
             current_history = current_session.get("history", [])
-            merged_history  = current_history + [
+            merged_history = current_history + [
                 {"role": "user",  "parts": [{"text": incoming_msg}]},
                 {"role": "model", "parts": [{"text": bot_text}]},
             ]
             current_session["history"]     = merged_history[-MAX_HISTORY_MESSAGES:]
             current_session["last_active"] = now
-            conversations[user_id]         = current_session
+            state["conversations"][user_id] = current_session
+            _save_state(state)
 
         return bot_text
 
@@ -257,9 +337,8 @@ def get_gemini_response(user_id: str, incoming_msg: str) -> str:
         escalate_to_human(user_id, incoming_msg, now)
         return ESCALATION_PHRASE
 
-# ─── Webhook ──────────────────────────────────────────────────────────────────
 
-# ─── Webhook modificado con comandos de control ───────────────────────────────
+# ─── Webhook ──────────────────────────────────────────────────────────────────
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -277,19 +356,30 @@ def webhook():
     incoming_msg = request.values.get("Body", "").strip()
     from_number  = request.values.get("From", "").strip()
 
-    if not from_number: return "<Response></Response>", 200, {"Content-Type": "text/xml"}
+    if not from_number:
+        return "<Response></Response>", 200, {"Content-Type": "text/xml"}
 
-    # ─── NUEVA LÓGICA DE CONTROL MANUAL ──────────────────────────────────────
-    if incoming_msg.lower() == "/desactivar":
+    # ─── COMANDOS DE CONTROL ────────────────────────────────────────────────
+    msg_lower = incoming_msg.lower()
+
+    if msg_lower == "/desactivar":
+        # Mute por 4 horas + alerta a José Luis (él tiene el teléfono)
         escalate_to_human(from_number, "Control tomado por José Luis", time.time())
-        return '<?xml version="1.0" encoding="UTF-8"?><Response><Message>Modo humano activado. El bot está en silencio.</Message></Response>', 200, {"Content-Type": "text/xml"}
-    
-    if incoming_msg.lower() == "/reanudar":
+        return _twiml_response("🔇 Bot desactivado. Escribe /reanudar cuando quieras que vuelva.")
+
+    if msg_lower == "/reanudar":
         with data_lock:
-            if from_number in muted_contacts:
-                del muted_contacts[from_number]
-        return '<?xml version="1.0" encoding="UTF-8"?><Response><Message>Modo bot reactivado. El asistente retoma la atención.</Message></Response>', 200, {"Content-Type": "text/xml"}
-    # ─────────────────────────────────────────────────────────────────────────
+            state = _load_state()
+            was_muted = from_number in state.get("muted_contacts", {})
+            if was_muted:
+                del state["muted_contacts"][from_number]
+                _save_state(state)
+        if was_muted:
+            logger.info(f"Bot reanudado por {from_number}")
+            return _twiml_response("✅ Bot reanudado. ¿En qué puedo ayudarte?")
+        else:
+            return _twiml_response("ℹ️ El bot ya estaba activo. ¿En qué puedo ayudarte?")
+    # ────────────────────────────────────────────────────────────────────────
 
     if not incoming_msg:
         return "<Response></Response>", 200, {"Content-Type": "text/xml"}
@@ -302,10 +392,8 @@ def webhook():
     if not bot_response:
         return "<Response></Response>", 200, {"Content-Type": "text/xml"}
 
-    safe_response = bot_response.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&apos;")
-    
-    twiml = f'<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n    <Message>{safe_response}</Message>\n</Response>'
-    return twiml, 200, {"Content-Type": "text/xml"}
+    return _twiml_response(bot_response)
+
 
 # ─── Salud ────────────────────────────────────────────────────────────────────
 
@@ -313,12 +401,13 @@ def webhook():
 def health():
     now = time.time()
     with data_lock:
+        state = _load_state()
         sessions_vivas = sum(
-            1 for s in conversations.values()
-            if (now - s["last_active"]) < SESSION_TIMEOUT_SECONDS
+            1 for s in state.get("conversations", {}).values()
+            if (now - s.get("last_active", 0)) < SESSION_TIMEOUT_SECONDS
         )
         muted_activos = sum(
-            1 for expiry in muted_contacts.values()
+            1 for expiry in state.get("muted_contacts", {}).values()
             if now < expiry
         )
     return {
@@ -327,14 +416,13 @@ def health():
         "muted_activos":  muted_activos,
     }, 200
 
-# ─── Inicio del thread de cleanup al nivel del módulo ─────────────────────────
-# FIX: fuera del bloque if __name__ == "__main__" para que Gunicorn también
-# lo arranque. Con __main__ solo funcionaría con `python main.py`, no en prod.
+
+# ─── Inicio del thread de cleanup ─────────────────────────────────────────────
 _cleanup_thread = threading.Thread(target=_cleanup_expired_sessions, daemon=True)
 _cleanup_thread.start()
 logger.info("Thread de cleanup iniciado.")
 
-# ─── Entry point (desarrollo local) ──────────────────────────────────────────
+# ─── Entry point ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     port  = int(os.environ.get("PORT", 5000))
     debug = os.environ.get("FLASK_DEBUG", "false").lower() == "true"
