@@ -259,6 +259,8 @@ def get_gemini_response(user_id: str, incoming_msg: str) -> str:
 
 # ─── Webhook ──────────────────────────────────────────────────────────────────
 
+# ─── Webhook modificado con comandos de control ───────────────────────────────
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     if VALIDATE_TWILIO:
@@ -269,45 +271,40 @@ def webhook():
         public_url = f"{scheme}://{host}{request.path}"
         signature  = request.headers.get("X-Twilio-Signature", "")
         if not validator.validate(public_url, request.form.to_dict(), signature):
-            logger.warning("Firma Twilio inválida — petición rechazada.")
+            logger.warning("Firma Twilio inválida.")
             return "Forbidden", 403
 
     incoming_msg = request.values.get("Body", "").strip()
     from_number  = request.values.get("From", "").strip()
 
-    if not from_number:
-        logger.warning("Petición sin campo 'From'. Ignorada.")
-        return "<Response></Response>", 200, {"Content-Type": "text/xml"}
+    if not from_number: return "<Response></Response>", 200, {"Content-Type": "text/xml"}
+
+    # ─── NUEVA LÓGICA DE CONTROL MANUAL ──────────────────────────────────────
+    if incoming_msg.lower() == "/desactivar":
+        escalate_to_human(from_number, "Control tomado por José Luis", time.time())
+        return '<?xml version="1.0" encoding="UTF-8"?><Response><Message>Modo humano activado. El bot está en silencio.</Message></Response>', 200, {"Content-Type": "text/xml"}
+    
+    if incoming_msg.lower() == "/reanudar":
+        with data_lock:
+            if from_number in muted_contacts:
+                del muted_contacts[from_number]
+        return '<?xml version="1.0" encoding="UTF-8"?><Response><Message>Modo bot reactivado. El asistente retoma la atención.</Message></Response>', 200, {"Content-Type": "text/xml"}
+    # ─────────────────────────────────────────────────────────────────────────
 
     if not incoming_msg:
         return "<Response></Response>", 200, {"Content-Type": "text/xml"}
 
     now = time.time()
-
     if _is_muted(from_number, now):
-        logger.info(f"Webhook: {from_number} en silencio, mensaje ignorado.")
         return "<Response></Response>", 200, {"Content-Type": "text/xml"}
 
     bot_response = get_gemini_response(from_number, incoming_msg)
-
     if not bot_response:
         return "<Response></Response>", 200, {"Content-Type": "text/xml"}
 
-    safe_response = (
-        bot_response
-        .replace("&",  "&amp;")
-        .replace("<",  "&lt;")
-        .replace(">",  "&gt;")
-        .replace('"',  "&quot;")
-        .replace("'",  "&apos;")
-    )
-
-    twiml = (
-        '<?xml version="1.0" encoding="UTF-8"?>\n'
-        "<Response>\n"
-        f"    <Message>{safe_response}</Message>\n"
-        "</Response>"
-    )
+    safe_response = bot_response.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&apos;")
+    
+    twiml = f'<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n    <Message>{safe_response}</Message>\n</Response>'
     return twiml, 200, {"Content-Type": "text/xml"}
 
 # ─── Salud ────────────────────────────────────────────────────────────────────
