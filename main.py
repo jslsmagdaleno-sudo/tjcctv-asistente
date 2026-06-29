@@ -359,11 +359,10 @@ def webhook():
     if not from_number:
         return "<Response></Response>", 200, {"Content-Type": "text/xml"}
 
-    # ─── COMANDOS DE CONTROL ────────────────────────────────────────────────
+    # ─── COMANDOS DE CONTROL — ANTES de revisar si está muteado ─────────────
     msg_lower = incoming_msg.lower()
 
     if msg_lower == "/desactivar":
-        # Mute por 4 horas + alerta a José Luis (él tiene el teléfono)
         escalate_to_human(from_number, "Control tomado por José Luis", time.time())
         return _twiml_response("🔇 Bot desactivado. Escribe /reanudar cuando quieras que vuelva.")
 
@@ -379,7 +378,7 @@ def webhook():
             return _twiml_response("✅ Bot reanudado. ¿En qué puedo ayudarte?")
         else:
             return _twiml_response("ℹ️ El bot ya estaba activo. ¿En qué puedo ayudarte?")
-    # ────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
 
     if not incoming_msg:
         return "<Response></Response>", 200, {"Content-Type": "text/xml"}
