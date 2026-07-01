@@ -449,7 +449,7 @@ def get_gemini_response(user_id: str, incoming_msg: str) -> str:
                 "Content-Type": "application/json",
                 "x-goog-api-key": GEMINI_API_KEY,
             },
-            timeout=25,
+            timeout=11,
         )
         resp.raise_for_status()
         data = resp.json()
