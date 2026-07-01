@@ -426,14 +426,19 @@ def get_gemini_response(user_id: str, incoming_msg: str) -> str:
 
     # NOTA (jun 2026): Google migró las claves nuevas al formato "AQ." (tipo Auth).
     # Estas claves van en el header x-goog-api-key, no en el query string ?key=.
-    # Modelo actualizado: gemini-1.5-flash fue retirado, ahora se usa gemini-3.5-flash.
+    # Modelo: gemini-3.1-flash-lite — más rápido para WhatsApp en tiempo real.
+    # gemini-3.5-flash tiene "thinking" activado y tarda 15-20s (excede el timeout).
+    # gemini-3.1-flash-lite responde en 2-4s. thinkingBudget=0 desactiva el razonamiento.
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
-        "gemini-3.5-flash:generateContent"
+        "gemini-3.1-flash-lite:generateContent"
     )
     payload = {
         "contents": contents,
         "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "generationConfig": {
+            "thinkingConfig": {"thinkingBudget": 0}
+        },
     }
 
     try:
@@ -444,7 +449,7 @@ def get_gemini_response(user_id: str, incoming_msg: str) -> str:
                 "Content-Type": "application/json",
                 "x-goog-api-key": GEMINI_API_KEY,
             },
-            timeout=11,
+            timeout=25,
         )
         resp.raise_for_status()
         data = resp.json()
